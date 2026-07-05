@@ -1,0 +1,140 @@
+name: kdex-multiarch
+
+# Interim multi-arch (amd64 + arm64) publish of the kpack component images to
+# the kdex container registry (ghcr.io/kdex-tech/kpack).
+#
+# WHY THIS EXISTS: upstream kpack gained a full multi-arch CI pipeline in
+# #1947/#1949/#1951, but the newest RELEASE (v0.17.2, 2026-06-17) was tagged
+# BEFORE that landed, so its published images are amd64-only. kpack's release
+# cadence is best-effort (~6-8 months between the last few), so rather than wait
+# for the next upstream tag we publish multi-arch images from this fork's `main`
+# (which does include the multi-arch work) to our own registry as an interim.
+#
+# DESIGN: self-contained and ADDITIVE — it does NOT modify upstream's ci.yaml
+# (so the fork stays trivially mergeable with upstream) and skips the
+# unit/e2e/carvel-release gating (which needs secrets we don't carry on the
+# fork). It reuses the upstream `pack-build` composite action verbatim, so the
+# built images are byte-for-byte the same recipe as a real kpack release; only
+# the destination registry and the index-assembly are ours. When upstream cuts
+# a multi-arch release, delete this file and consume the official images.
+#
+# Retire criterion: an upstream kpack release whose ghcr images are a genuine
+# multi-arch index (verify with `crane manifest ... | jq '.manifests'`).
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version tag to publish (e.g. 0.17.3-kdex.1). Omit to publish only :<sha> and :latest.'
+        required: false
+  push:
+    tags:
+    - 'kdex-v*'
+
+defaults:
+  run:
+    shell: bash
+
+# ghcr push needs packages:write. Declared here (least-privilege, workflow-
+# scoped) instead of flipping the repo-wide default token permissions.
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io/kdex-tech/kpack
+  PACK_VERSION: '0.40.7'
+
+jobs:
+  component-image:
+    name: Build ${{ matrix.component.name }} (${{ matrix.platform.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        component:
+        - { name: controller,   command_dir: ./cmd/controller }
+        - { name: webhook,      command_dir: ./cmd/webhook }
+        - { name: completion,   command_dir: ./cmd/completion }
+        - { name: build-init,   command_dir: ./cmd/build-init }
+        - { name: build-waiter, command_dir: ./cmd/build-waiter }
+        - { name: rebase,       command_dir: ./cmd/rebase }
+        platform:
+        - { name: linux/amd64, architecture: amd64, runner: ubuntu-24.04 }
+        - { name: linux/arm64, architecture: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.platform.runner }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Docker Login
+      uses: docker/login-action@v3.3.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Build
+      uses: ./.github/actions/pack-build
+      with:
+        pack_version: ${{ env.PACK_VERSION }}
+        tag: ${{ env.REGISTRY }}/${{ matrix.component.name }}:${{ github.sha }}-${{ matrix.platform.architecture }}
+        command_dir: ${{ matrix.component.command_dir }}
+        platform: ${{ matrix.platform.name }}
+        cache_image: ${{ env.REGISTRY }}/${{ matrix.component.name }}-cache-${{ matrix.platform.architecture }}
+        artifact_name: ${{ matrix.component.name }}-image-${{ matrix.platform.architecture }}
+
+  component-index:
+    name: Assemble multi-arch indexes
+    needs: component-image
+    runs-on: ubuntu-24.04
+    steps:
+    - name: Setup crane
+      uses: imjasonh/setup-crane@v0.4
+    - name: Docker Login
+      uses: docker/login-action@v3.3.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    - name: Resolve version tag
+      run: |
+        if [[ "$GITHUB_REF" =~ ^refs/tags/kdex-v(.*)$ ]]; then
+          echo "VERSION=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+        else
+          echo "VERSION=${{ inputs.version }}" >> "$GITHUB_ENV"
+        fi
+    - name: Download architecture-specific image references
+      uses: actions/download-artifact@v4
+      with:
+        pattern: '*-image-*'
+        path: image-refs
+        merge-multiple: true
+    - name: Assemble and verify multi-arch indexes
+      run: |
+        set -euo pipefail
+        for name in controller webhook completion build-init build-waiter rebase; do
+          dest="${REGISTRY}/${name}:${GITHUB_SHA}"
+
+          # Assemble the two per-arch manifests into one multi-arch index.
+          crane index append \
+            -m "$(cat "image-refs/${name}-amd64")" \
+            -m "$(cat "image-refs/${name}-arm64")" \
+            -t "$dest"
+
+          digest="$(crane digest "$dest")"
+          ref="${REGISTRY}/${name}@${digest}"
+
+          # Fan the same index digest out to :latest and (if set) :<version>.
+          crane tag "$ref" latest
+          if [[ -n "${VERSION:-}" ]]; then
+            crane tag "$ref" "${VERSION}"
+          fi
+
+          # Verify the published index really covers both platforms.
+          manifest="$(crane manifest "$ref")"
+          for platform in linux/amd64 linux/arm64; do
+            jq -e --arg p "$platform" \
+              '[.manifests[].platform | "\(.os)/\(.architecture)"] | index($p) != null' \
+              <<< "$manifest" > /dev/null
+          done
+
+          echo "published multi-arch (amd64+arm64): $ref  tags=[${GITHUB_SHA}, latest${VERSION:+, $VERSION}]"
+        done
